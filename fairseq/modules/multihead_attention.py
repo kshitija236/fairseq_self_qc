@@ -713,15 +713,15 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         if key_padding_mask is not None:
             # don't attend to padding symbols
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            key_padding_mask_bool = key_padding_mask.to(torch.bool)
             if not is_tpu:
                 attn_weights = attn_weights.view(
                     kv_bsz, -1, self.num_heads, tgt_len, src_len
                 )
                 attn_weights = attn_weights.masked_fill(
-                    key_padding_mask.unsqueeze(1)
+                    key_padding_mask_bool.unsqueeze(1)
                     .unsqueeze(2)
-                    .unsqueeze(3)
-                    .to(torch.bool),
+                    .unsqueeze(3),
                     float("-inf"),
                 )
             else:

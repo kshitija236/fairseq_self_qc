@@ -183,7 +183,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
 
-    def forward(
+    def forward( #qc step add
         self,
         prev_output_tokens,
         encoder_out: Optional[Dict[str, List[Tensor]]] = None,
@@ -194,6 +194,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         alignment_heads: Optional[int] = None,
         src_lengths: Optional[Any] = None,
         return_all_hiddens: bool = False,
+        step: Optional = None,
     ):
         """
         Args:
@@ -221,6 +222,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             full_context_alignment=full_context_alignment,
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
+            step=step, #qc step add
         )
 
         if not features_only:
@@ -235,6 +237,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
+        step: Optional = None, #qc step add
     ):
         return self.extract_features_scriptable(
             prev_output_tokens,
@@ -243,6 +246,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             full_context_alignment,
             alignment_layer,
             alignment_heads,
+            step, #qc step add
         )
 
     """
@@ -259,6 +263,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
+        step: Optional[int] = None,
     ):
         """
         Similar to *forward* but only return features.
@@ -294,7 +299,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         positions = None
         if self.embed_positions is not None:
             positions = self.embed_positions(
-                prev_output_tokens, incremental_state=incremental_state
+                prev_output_tokens, incremental_state=incremental_state, step=step, #qc step add
             )
 
         if incremental_state is not None:

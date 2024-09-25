@@ -68,6 +68,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         self,
         input,
         incremental_state: Optional[Any] = None,
+        step: Optional[int] = 0,  # qc step add
         timestep: Optional[Tensor] = None,
         positions: Optional[Any] = None,
     ):
@@ -83,7 +84,9 @@ class SinusoidalPositionalEmbedding(nn.Module):
 
         if incremental_state is not None:
             # positions is the same for every token when decoding a single step
-            pos = timestep.view(-1)[0] + 1 if timestep is not None else seq_len
+            #pos = timestep.view(-1)[0] + 1 if timestep is not None else seq_len   #qc commented out
+            pos = step[0,0] # #qc modify this pos (pass this from step pos = step + 1
+
             if self.onnx_trace:
                 return (
                     self.weights.index_select(index=self.padding_idx + pos, dim=0)

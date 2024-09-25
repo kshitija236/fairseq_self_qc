@@ -6,16 +6,23 @@
 import math
 import sys
 from typing import Dict, List, Optional
+import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
+import os
 
 from fairseq import search, utils
 from fairseq.data import data_utils
 from fairseq.models import FairseqIncrementalDecoder
 from fairseq.ngram_repeat_block import NGramRepeatBlock
 
+import numpy as np
+import onnxruntime as ort
+
+qc_fixed_shape = 30
 
 class SequenceGenerator(nn.Module):
     def __init__(
@@ -129,7 +136,7 @@ class SequenceGenerator(nn.Module):
         self.lm_weight = lm_weight
         if self.lm_model is not None:
             self.lm_model.eval()
-
+        
     def cuda(self):
         self.model.cuda()
         return self
@@ -218,6 +225,12 @@ class SequenceGenerator(nn.Module):
             ],
         )
         net_input = sample["net_input"]
+        #qc shape fixing
+        original_seq_len = net_input['src_lengths'].item()
+        if original_seq_len < qc_fixed_shape:
+            diff = qc_fixed_shape - net_input['src_lengths'].item()
+            net_input['src_lengths'] = torch.full(net_input['src_lengths'].shape, qc_fixed_shape)
+            net_input['src_tokens'] = F.pad(net_input['src_tokens'], (0, diff), mode='constant', value=self.pad)
 
         if "src_tokens" in net_input:
             src_tokens = net_input["src_tokens"]
@@ -279,6 +292,15 @@ class SequenceGenerator(nn.Module):
         with torch.autograd.profiler.record_function("EnsembleModel: forward_encoder"):
             encoder_outs = self.model.forward_encoder(net_input)
 
+        # def get_dumps_encoder(value_list):
+        #     for key in value_list[0].keys():
+        #         if (len(value_list[0][key]) > 0):
+        #             torch.save(value_list[0][key][0], './cosine_similarity/encoder_dumps_static/' + 'encoder_output_' + key + '.pt')
+        #
+        # #torch.save(encoder_outs[0]['encoder_padding_mask'][0], 'encoder_out_padding_mask.pt') #dumps
+        # get_dumps_encoder(encoder_outs)
+
+        encoder_outs[0]['encoder_padding_mask'][0] = encoder_outs[0]['encoder_padding_mask'][0].to(torch.uint8) #qc added this to handle issues with bool tensor in decoder loading
         # placeholder of indices for bsz * beam_size to hold tokens and accumulative scores
         new_order = torch.arange(bsz).view(-1, 1).repeat(1, beam_size).view(-1)
         new_order = new_order.to(src_tokens.device).long()
@@ -357,8 +379,13 @@ class SequenceGenerator(nn.Module):
             with torch.autograd.profiler.record_function(
                 "EnsembleModel: forward_decoder"
             ):
+                #qc shape fixing
+                step_tensor = torch.tensor(step).unsqueeze(0).unsqueeze(1)
                 lprobs, avg_attn_scores = self.model.forward_decoder(
-                    tokens[:, : step + 1],
+                    #tokens[:, : step + 1],
+                    step_tensor, #qc added
+                    tokens[:, step : step + 1], #qc modified this to pass last token only
+                    #tokens[:, : step+1],  #qc experimental
                     encoder_outs,
                     incremental_states,
                     self.temperature,
@@ -454,17 +481,17 @@ class SequenceGenerator(nn.Module):
                 )
 
                 finalized_sents = self.finalize_hypos(
-                    step,
-                    eos_bbsz_idx,
-                    eos_scores,
-                    tokens,
-                    scores,
-                    finalized,
-                    finished,
-                    beam_size,
-                    attn,
-                    src_lengths,
-                    max_len,
+                    step,          
+                    eos_bbsz_idx,  
+                    eos_scores,    
+                    tokens,        
+                    scores,        
+                    finalized,     
+                    finished,      
+                    beam_size,     
+                    attn,          
+                    src_lengths,   
+                    max_len,       
                 )
                 num_remaining_sent -= len(finalized_sents)
 
@@ -774,6 +801,161 @@ class EnsembleModel(nn.Module):
         ):
             self.has_incremental = True
 
+        self.save_onnx = False
+        self.ort_engine = True
+        self.decode_onnx_tag = 0
+
+        self.FILE_PATH = sys.path[0]
+        if not os.path.exists(self.FILE_PATH+"/../onnx_models"):
+            os.makedirs(self.FILE_PATH+"/../onnx_models")
+            
+        if self.ort_engine:
+
+
+
+            # ORT CPU
+            # encoder_onnx_path = self.FILE_PATH+"/../onnx_models/encoder_fixed.onnx"
+            # decoder0_onnx_path = self.FILE_PATH+"/../onnx_models/decoder0fixed.onnx"
+            # decoder1_onnx_path = self.FILE_PATH+"/../onnx_models/decoder1fixed.onnx"
+            # #
+            #
+            # self.encoder_ort_session = ort.InferenceSession(encoder_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options=[execution_provider_option_cpu]
+            #                                                 )
+            #
+            # self.decoder0_ort_session = ort.InferenceSession(decoder0_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options = [execution_provider_option_cpu]
+            #                                                 )
+            #
+            # self.decoder1_ort_session = ort.InferenceSession(decoder1_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options=[execution_provider_option_cpu]
+            #                                                 )
+
+            # # ORT CPU FP16
+            # encoder_onnx_path = self.FILE_PATH+"/../onnx_models/model_enc_fp16.onnx"
+            # decoder0_onnx_path = self.FILE_PATH+"/../onnx_models/model_dec0_fp16.onnx"
+            # decoder1_onnx_path = self.FILE_PATH+"/../onnx_models/model_dec1_fp16.onnx"
+            # #
+            #
+            # self.encoder_ort_session = ort.InferenceSession(encoder_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options=[execution_provider_option_cpu]
+            #                                                 )
+            #
+            # self.decoder0_ort_session = ort.InferenceSession(decoder0_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options = [execution_provider_option_cpu]
+            #                                                 )
+            #
+            # self.decoder1_ort_session = ort.InferenceSession(decoder1_onnx_path,
+            #                                                 providers=["CPUExecutionProvider"],
+            #                                                 #provider_options=[execution_provider_option_cpu]
+            #                                                 )
+
+            # #ORT QNN CPU
+            # execution_provider_option_qnn_cpu = {
+            #     "backend_path": r"C:\Users\HCKTest\Desktop\kshitij\fs_shape_fix\fairseq\QnnCpu.dll",
+            #     #"session.enable_htp_fp16_precision": "1",
+            # }
+            #
+            # self.encoder_ort_session = ort.InferenceSession(encoder_onnx_path,
+            #                                                  providers=["QNNExecutionProvider"],
+            #                                                  provider_options=[execution_provider_option_qnn_cpu]
+            #                                                  # sess_options=options
+            #                                                  )
+            #
+            # self.decoder0_ort_session = ort.InferenceSession(decoder0_onnx_path,
+            #                                                   providers=["QNNExecutionProvider"],
+            #                                                   provider_options=[execution_provider_option_qnn_cpu]
+            #                                                   # sess_options=options
+            #                                                   )
+            #
+            # self.decoder1_ort_session = ort.InferenceSession(decoder1_onnx_path,
+            #                                                   providers=["QNNExecutionProvider"],
+            #                                                   provider_options=[execution_provider_option_qnn_cpu]
+            #                                                   )
+
+            #ORT QNN HTP
+            options = ort.SessionOptions()
+            # options.log_severity_level = 0
+            options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+            #options.log_severity_level = 0
+
+            # #fixed length 30
+            encoder_onnx_path = self.FILE_PATH+"/../onnx_models/30encoder_fixed_net_qnn_ctx.onnx"
+            decoder0_onnx_path = self.FILE_PATH+"/../onnx_models/30decoder0fixed_net_qnn_ctx.onnx"
+            decoder1_onnx_path = self.FILE_PATH+"/../onnx_models/30decoder1fixed_net_qnn_ctx.onnx"
+
+            #fixed length 5 OR 100
+            #encoder_onnx_path = self.FILE_PATH+"/../onnx_models/100encoder_fixed_net_qnn_ctx.onnx"
+            #decoder0_onnx_path = self.FILE_PATH+"/../onnx_models/100decoder0fixed_net_qnn_ctx.onnx"
+            #decoder1_onnx_path = self.FILE_PATH+"/../onnx_models/100decoder1fixed_net_qnn_ctx.onnx"
+
+            execution_provider_option_htp = {"backend_path": r"C:\Users\HCKTest\Desktop\kshitij\fs_shape_fix\fairseq\QnnHtp.dll",
+                                             "htp_performance_mode": "burst",
+                                             #"session.enable_htp_fp16_precision": "1"
+                                             }
+
+
+            self.encoder_ort_session = ort.InferenceSession(encoder_onnx_path,
+                               providers=["QNNExecutionProvider"],
+                               provider_options=[execution_provider_option_htp],
+                               sess_options=options
+                               )
+
+            self.decoder0_ort_session = ort.InferenceSession(decoder0_onnx_path,
+                                                            providers=["QNNExecutionProvider"],
+                                                            provider_options=[execution_provider_option_htp],
+                                                            sess_options=options
+                                                            )
+
+            self.decoder1_ort_session = ort.InferenceSession(decoder1_onnx_path,
+                                                             providers=["QNNExecutionProvider"],
+                                                             provider_options=[execution_provider_option_htp],
+                                                             sess_options=options
+                                                             )
+
+            # # ORT QNN HTP online
+            # options = ort.SessionOptions()
+            # # options.log_severity_level = 0
+            # options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+            # options.log_severity_level = 0
+            #
+            #
+            # encoder_onnx_path = self.FILE_PATH + "/../onnx_models/encoder_fixed.onnx"
+            # decoder0_onnx_path = self.FILE_PATH + "/../onnx_models/modified_decoder0.onnx"
+            # decoder1_onnx_path = self.FILE_PATH + "/../onnx_models/modified_decoder1.onnx"
+            #
+            #
+            #
+            # execution_provider_option_htp = {"backend_path": r"C:\Users\HCKTest\Desktop\kshitij\fs_shape_fix\fairseq\QnnHtp.dll",
+            #                                  "htp_performance_mode": "burst",
+            #                                  "session.enable_htp_fp16_precision": "1"
+            #                                  }
+            #
+            #
+            # self.encoder_ort_session = ort.InferenceSession(encoder_onnx_path,
+            #                    providers=["QNNExecutionProvider"],
+            #                    provider_options=[execution_provider_option_htp],
+            #                    #sess_options=options
+            #                    )
+            #
+            # self.decoder0_ort_session = ort.InferenceSession(decoder0_onnx_path,
+            #                                                 providers=["QNNExecutionProvider"],
+            #                                                 provider_options=[execution_provider_option_htp],
+            #                                                 #sess_options=options
+            #                                                 )
+            #
+            # self.decoder1_ort_session = ort.InferenceSession(decoder1_onnx_path,
+            #                                                  providers=["QNNExecutionProvider"],
+            #                                                  provider_options=[execution_provider_option_htp],
+            #                                                  # sess_options=options
+            #                                                  )
+
+
     def forward(self):
         pass
 
@@ -800,15 +982,344 @@ class EnsembleModel(nn.Module):
                 if hasattr(model, "set_beam_size"):
                     model.set_beam_size(beam_size)
 
+    def ORT_Inference_encoder(self,net_input):
+        src_tokens = net_input["src_tokens"]
+        src_lengths = net_input["src_lengths"]
+
+        input_onnx = {"src_tokens": src_tokens.numpy()}
+        #input_onnx = {"src_tokens": src_tokens.numpy().astype(np.int32)}   #qc typecast required for htp
+
+        encoder_result = self.encoder_ort_session.run(None, input_onnx)
+        # enc = encoder_result[0]
+        # encoder_padding_mask = encoder_result[1]
+        # encoder_embedding = encoder_result[2]
+        # src_lengths = encoder_result[3]
+
+        #for htp, this ordering needs to be modified as below, qc shape fix
+        enc = encoder_result[0]
+        encoder_padding_mask = encoder_result[3]
+        encoder_padding_mask = encoder_padding_mask.astype(np.uint8)
+        encoder_embedding = encoder_result[2]
+        src_lengths = encoder_result[1]
+
+        encoder_result_dict={'encoder_out': [torch.from_numpy(enc)],
+                             'encoder_padding_mask': [torch.from_numpy(encoder_padding_mask)],
+                             'encoder_embedding':[torch.from_numpy(encoder_embedding)], 
+                             'encoder_states': [], 
+                             'fc_results':[],
+                             'src_tokens': [], 
+                             'src_lengths': [torch.from_numpy(src_lengths)]}
+        return encoder_result_dict
+    
+    def encoder_export_onnx(self,net_input):
+        model = self.models[0]
+        model.prepare_for_onnx_export_()
+        model.eval()
+        torch.onnx.export(model.encoder, (net_input),
+                    self.FILE_PATH+"/../onnx_models/encoder_fixed.onnx",
+                    input_names=["src_tokens","src_lengths"],
+                    # dynamic_axes={'src_tokens' : {0:"batch_size",
+                    #                               1:"src_lengths"},
+                    #               'src_lengths' : {0:"src_lengths"},
+                    #               },
+                    operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
+                    do_constant_folding=False,
+                    verbose=True
+                    )
+        print("== Export Encoder onnx success ==")
+
     @torch.jit.export
-    def forward_encoder(self, net_input: Dict[str, Tensor]):
+    def forward_encoder_ORT(self, net_input: Dict[str, Tensor]):
         if not self.has_encoder():
             return None
-        return [model.encoder.forward_torchscript(net_input) for model in self.models]
+        encoder_result_dict = self.ORT_Inference_encoder(net_input)
+        return [encoder_result_dict]
 
+    @torch.jit.export
+    def forward_encoder(self, net_input: Dict[str, Tensor]):
+        if self.save_onnx:
+            self.encoder_export_onnx(net_input)
+        if not self.has_encoder():
+            return None
+        encoder_start_time = time.perf_counter()
+        if self.ort_engine:
+            encoder_result = self.forward_encoder_ORT(net_input)
+            encoder_time = time.perf_counter() - encoder_start_time
+            print(f"==ORT encoder time=={encoder_time * 1000:.2f} ms")
+        else:
+            encoder_result = [model.encoder.forward_torchscript(net_input) for model in self.models]
+            encoder_time = time.perf_counter() - encoder_start_time
+            print("==torch encoder_time==",encoder_time)
+
+        return encoder_result
+
+    def decoder_export_onnx(self, model, step, tokens, encoder_out, incremental_states, model_idx):
+        inputs = {}
+        input_names = ["tokens"]
+        #dynamic_axes = {'tokens': {0: "batch_size", 1: "seq_len"}}  #qc commented out
+        dynamic_axes = {}
+
+        output_names = ["output", "attn"]
+        
+        for i in range(7):
+            output_names.append("inner_status_"+str(i))
+
+        for i in range(len(incremental_states)):
+            pk = "prev_key_"+str(i)
+            pv = "prev_value_"+str(i)
+            pk_pm = "prev_key_padding_mask_"+str(i)  #qc added prev key padding mask
+
+            #qc prepare prev key padding mask
+            # if i % 2 == 1:
+            #     inputs[pk_pm] = encoder_out["encoder_padding_mask"][0]
+            #
+            # else:
+            #     tensor = torch.ones((1, qc_fixed_shape), dtype=torch.uint8)
+            #     tensor[0, -(step[0,0]):] = 0
+            #     inputs[pk_pm] = tensor
+
+            inputs[pk] = list(incremental_states.values())[i]["prev_key"]
+            inputs[pv] = list(incremental_states.values())[i]["prev_value"]
+            #inputs[pk_pm] = list(incremental_states.values())[i]["prev_key_padding_mask"] #qc remove and prepare separetely
+            #qc shape fixing
+            if inputs[pk].size(2) < qc_fixed_shape:
+                expanded_tensor_pk = torch.zeros(1, 16, qc_fixed_shape, 64)
+                #expanded_tensor_pk[:, :, :inputs[pk].size(2), :] = inputs[pk]     #qc right padding
+                expanded_tensor_pk[:, :, qc_fixed_shape - 1:, :] = inputs[pk]      #qc left padding
+                inputs[pk] = expanded_tensor_pk
+                # tensor = torch.ones((1, qc_fixed_shape)).type(torch.uint8)     # qc decoder self attention padding mask creation, qc remove
+                # tensor[0, -1] = 0
+                # inputs[pk_pm] = tensor
+
+            # qc shape fixing
+            if inputs[pv].size(2) < qc_fixed_shape:  # qc shape fixing
+                expanded_tensor_pv = torch.zeros(1, 16, qc_fixed_shape, 64)
+                expanded_tensor_pv[:, :, qc_fixed_shape - 1:, :] = inputs[pv]
+                inputs[pv] = expanded_tensor_pv
+
+            if i % 2 == 1:
+                inputs[pk_pm] = encoder_out["encoder_padding_mask"][0]
+
+            else:
+                tensor = torch.ones((1, qc_fixed_shape), dtype=torch.uint8)
+                tensor[0, -(step[0,0]):] = 0
+                inputs[pk_pm] = tensor
+
+            input_names.append(pk)
+            input_names.append(pv)
+            input_names.append(pk_pm)
+            dynamic_axes[pk] = {0: "batch_size", 2: "seq_len"}
+            dynamic_axes[pv] = {0: "batch_size", 2: "seq_len"}
+
+        # Output names
+        if step[0,0] == 0:
+            for i in range(12):
+                pk = "key_"+str(i)
+                pv = "value_"+str(i)
+                #kpm = "key_padding_mask_"+str(i) #qc remove
+                output_names.append(pk)
+                output_names.append(pv)
+                # if i%2 == 1:                    #qc remove
+                #     output_names.append(kpm)
+
+        else:
+            for i in range(12):
+                pk = "key_"+str(i)
+                pv = "value_"+str(i)
+                #kpm = "key_padding_mask_"+str(i)   #qc remove
+                output_names.append(pk)
+                output_names.append(pv)
+                #output_names.append(kpm)         #qc remove
+            # dynamic_axes[pk] = {0: "batch_size", 2: "seq_len"}
+            # dynamic_axes[pv] = {0: "batch_size", 2: "seq_len"}
+
+        inputs["encoder_out"] = encoder_out["encoder_out"]
+        input_names.append("encoder_out")
+        #dynamic_axes["encoder_out"] = {0: "batch_size", 1: "seq_len"}   #qc commented out
+
+        inputs["encoder_padding_mask"] = encoder_out["encoder_padding_mask"]
+        input_names.append("encoder_padding_mask")
+        input_names.append("step")
+        #dynamic_axes["encoder_padding_mask"] = {0: "batch_size", 1: "seq_len"}    #qc commented out
+        input_data = (tokens, inputs, step, {"ignore_param": "ignore_p"})
+
+        torch.onnx.export(model.decoder, input_data,
+            self.FILE_PATH+"/../onnx_models/decoder"+str(model_idx)+"fixed.onnx",
+            input_names = input_names,
+            output_names = output_names,
+            #dynamic_axes= dynamic_axes,
+            #operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+            verbose=True
+            )
+        
+
+        print("== Export Decoder onnx success ==")
+
+
+    def ORT_Inference_decoder(self,step,tokens,encoder_out,incremental_state=None):
+        enc = encoder_out["encoder_out"][0].numpy()
+        padding_mask = encoder_out["encoder_padding_mask"][0].numpy()
+
+        decoder_input = {
+                         #"step": step,
+                         "tokens": tokens
+                         #"encoder_padding_mask": padding_mask
+                        }
+        
+        # Prepare inputs
+        if len(incremental_state) == 0: # First inference
+            decoder_input["encoder_out"] = enc
+            decoder_input["encoder_padding_mask"] = padding_mask
+
+        else:
+            for i in range(12):
+                decoder_input["prev_key_" + str(i)] = incremental_state["prev_key_" + str(i)]
+                decoder_input["prev_value_" + str(i)] = incremental_state["prev_value_" + str(i)]
+                if i%2 == 1:
+                    decoder_input["prev_key_padding_mask_" + str(i)] = encoder_out["encoder_padding_mask"][0].numpy()
+                else:
+                    array = np.ones((1, qc_fixed_shape), dtype=np.uint8)  # experimenting with datatype -> originally np.flaot32
+                    array[0, -(step[0, 0]):] = 0
+                    decoder_input["prev_key_padding_mask_" + str(i)] = array
+
+                    # if step[0,0] == 1: #for 2nd decoder 1st step
+            #     for i in range(12):
+            #         decoder_input["prev_key_" + str(i)] = incremental_state["prev_key_" + str(i)]
+            #         decoder_input["prev_value_" + str(i)] = incremental_state["prev_value_" + str(i)]
+            #         if i%2 == 1:
+            #             decoder_input["prev_key_padding_mask_" + str(i)] = incremental_state["prev_key_padding_mask_" + str(i)]
+            #
+            # else: #for 2nd decoder 2nd step onwards
+            #     for i in range(12):
+            #         decoder_input["prev_key_" + str(i)] = incremental_state["prev_key_" + str(i)]
+            #         decoder_input["prev_value_" + str(i)] = incremental_state["prev_value_" + str(i)]
+            #         decoder_input["prev_key_padding_mask_" + str(i)] = incremental_state["prev_key_padding_mask_" + str(i)]
+
+            #qc shape fixing
+            for i in range(12):
+               # print(i)
+                if decoder_input["prev_key_" + str(i)].shape[2] < qc_fixed_shape:
+                    expanded_array_pk = np.zeros((1, 16, qc_fixed_shape, 64), dtype=np.float32) #qnn requirement fp16 during inference
+                    #expanded_array_pk[:, :, :decoder_input["prev_key_" + str(i)].shape[2], :] = decoder_input["prev_key_" + str(i)]    #right padding
+                    expanded_array_pk[:, :, qc_fixed_shape-1:, :] = decoder_input["prev_key_" + str(i)]              #left padding
+                    decoder_input["prev_key_" + str(i)] = expanded_array_pk
+                    # array = np.ones((1, qc_fixed_shape), dtype=np.uint8) #experimenting with datatype -> originally np.flaot32
+                    # array[0, -1] = 0.0
+                    # decoder_input["prev_key_padding_mask_" + str(i)] = array        #qc added prev key padding mask
+
+
+                if decoder_input["prev_key_" + str(i)].shape[2] == qc_fixed_shape + 1:
+
+                    #decoder_input["prev_key_" + str(i)][:, :, step, :] = decoder_input["prev_key_" + str(i)][:, :, 1:, :]
+                    decoder_input["prev_key_" + str(i)] = decoder_input["prev_key_" + str(i)][:, :, 1:, :]
+                    #decoder_input["prev_key_padding_mask_" + str(i)] = decoder_input["prev_key_padding_mask_" + str(i)][:,1:] #qc modify decoder self attention padding mask
+
+                if decoder_input["prev_value_" + str(i)].shape[2] < qc_fixed_shape:
+                    expanded_array_pv = np.zeros((1, 16, qc_fixed_shape, 64), dtype=np.float32)
+                    #expanded_array_pv[:, :, :decoder_input["prev_value_" + str(i)].shape[2], :] = decoder_input["prev_value_" + str(i)]   #right padding
+                    expanded_array_pv[:, :, qc_fixed_shape - 1:, :] = decoder_input["prev_value_" + str(i)]                   #left padding
+                    decoder_input["prev_value_" + str(i)] = expanded_array_pv
+
+                if decoder_input["prev_value_" + str(i)].shape[2] == qc_fixed_shape + 1:
+                    #decoder_input["prev_value_" + str(i)][:, :, step, :] = decoder_input["prev_value_" + str(i)][:, :, 1:, :]
+                    decoder_input["prev_value_" + str(i)] = decoder_input["prev_value_" + str(i)][:, :, 1:, :]
+
+        decoder_input["step"] = step
+
+        #output names list required for qnn htp
+        output_names = ["output", "attn"]
+        for i in range(7):
+            output_names.append("inner_status_"+str(i))
+
+        for i in range(12):
+            pk = "key_"+str(i)
+            pv = "value_"+str(i)
+            output_names.append(pk)
+            output_names.append(pv)
+
+
+        # if step[0,0] == 0:
+        #     for i in range(12):
+        #         pk = "key_"+str(i)
+        #         pv = "value_"+str(i)
+        #         k_pm = "key_padding_mask_"+str(i)
+        #         output_names.append(pk)
+        #         output_names.append(pv)
+        #         if i%2 == 1:
+        #             output_names.append(k_pm)
+        #
+        # else:
+        #     for i in range(12):
+        #         pk = "key_"+str(i)
+        #         pv = "value_"+str(i)
+        #         k_pm = "key_padding_mask_"+str(i)
+        #         output_names.append(pk)
+        #         output_names.append(pv)
+        #         output_names.append(k_pm)
+
+
+        if len(incremental_state) == 0: # First inference
+            #prepare onnx input
+            for key, value in decoder_input.items():
+                if type(value).__module__ != 'numpy':
+                    decoder_input[key] = value.numpy() #.astype(np.float16)
+            decoder_result = self.decoder0_ort_session.run(output_names, decoder_input)
+
+        else:
+            for key, value in decoder_input.items():
+                if type(value).__module__ != 'numpy':
+                    decoder_input[key] = value.numpy()
+                #print(value.dtype)
+                # if value.dtype == np.float64:
+                #     value.astype(np.float32)
+
+            decoder_result = self.decoder1_ort_session.run(output_names, decoder_input)
+
+        # prepare onnx data
+        #for onnx
+        x = decoder_result[0]
+        attn = decoder_result[1]
+        inner_states_0 = decoder_result[2]
+        inner_states_1 = decoder_result[3]
+        inner_states_2 = decoder_result[4]
+        inner_states_3 = decoder_result[5]
+        inner_states_4 = decoder_result[6]
+        inner_states_5 = decoder_result[7]
+        inner_states_6 = decoder_result[8]
+        decoder_result_list = [torch.from_numpy(x),
+                            {"attn":[torch.from_numpy(attn)],
+                            "inner_states":[torch.from_numpy(inner_states_0),
+                                            torch.from_numpy(inner_states_1),
+                                            torch.from_numpy(inner_states_2),
+                                            torch.from_numpy(inner_states_3),
+                                            torch.from_numpy(inner_states_4),
+                                            torch.from_numpy(inner_states_5),
+                                            torch.from_numpy(inner_states_6)]}]
+
+        # Past key value
+        for i in range(12):
+            incremental_state["prev_key_" + str(i)] = decoder_result[9 + i * 2]
+            incremental_state["prev_value_" + str(i)] = decoder_result[9 + i * 2 + 1]
+        # if step[0,0] == 0:
+        #     for i in range(6):
+        #         incremental_state["prev_key_" + str(2*i)] = decoder_result[9 + i * 5]
+        #         incremental_state["prev_value_" + str(2*i)] = decoder_result[9 + i * 5 + 1]
+        #         incremental_state["prev_key_" + str(2 * i + 1)] = decoder_result[9 + i * 5 + 2]
+        #         incremental_state["prev_value_" + str(2 * i + 1)] = decoder_result[9 + i * 5 + 3]
+        #         incremental_state["prev_key_padding_mask_" + str(2 * i + 1)] = decoder_result[9 + i * 5 + 4]
+        #
+        # else:
+        #     for i in range(12):
+        #         incremental_state["prev_key_" + str(i)] = decoder_result[9 + i * 3]
+        #         incremental_state["prev_value_" + str(i)] = decoder_result[9 + i * 3 + 1]
+        #         incremental_state["prev_key_padding_mask_" + str(i)] = decoder_result[9 + i * 3 + 2]
+
+        return decoder_result_list
+    
     @torch.jit.export
     def forward_decoder(
         self,
+        step,
         tokens,
         encoder_outs: List[Dict[str, List[Tensor]]],
         incremental_states: List[Dict[str, Dict[str, Optional[Tensor]]]],
@@ -817,19 +1328,193 @@ class EnsembleModel(nn.Module):
         log_probs = []
         avg_attn: Optional[Tensor] = None
         encoder_out: Optional[Dict[str, List[Tensor]]] = None
+
+        # Override TransformerDecoderBase
+        from fairseq.models.transformer import TransformerDecoderBase
+        class QCTransformerDecoderBase(TransformerDecoderBase):
+            incremental_state_keys=[]
+            def forward(self, tokens, inputs, step): #qc step add
+                incremental_state = torch.jit.annotate(Dict[str, Dict[str, Optional[Tensor]]], {})
+                encoder_out = torch.jit.annotate(Dict[str, Optional[Tensor]], {})
+                idx = 0
+                if "prev_key_0" in list(inputs.keys()):
+                    for key in QCTransformerDecoderBase.incremental_state_keys:
+                        incremental_state[key] = {
+                            "prev_key": inputs["prev_key_"+str(idx)],
+                            "prev_value": inputs["prev_value_"+str(idx)],
+                            "prev_key_padding_mask": inputs["prev_key_padding_mask_"+str(idx)]   #qc added previous key padding mask #qc do not remove #temp remove
+                        }
+                        idx = idx + 1
+
+                encoder_out["encoder_out"] = inputs["encoder_out"]
+                encoder_out["encoder_padding_mask"] = inputs["encoder_padding_mask"]  
+
+                output = TransformerDecoderBase.forward(#step, #qc step add
+                                                        self=self,
+                                                        prev_output_tokens=tokens, 
+                                                        encoder_out=encoder_out, incremental_state=incremental_state,
+                                                        step=step)
+                if len(QCTransformerDecoderBase.incremental_state_keys) == 0:
+                    QCTransformerDecoderBase.incremental_state_keys = list(incremental_state.keys())
+
+                output_prev_kv = torch.jit.annotate(Dict[str, Optional[Tensor]], {})
+                for idx in range(len(incremental_state.keys())):
+                    pk = "prev_key_"+str(idx)
+                    pv = "prev_value_"+str(idx)
+                    #pk_pm = "prev_key_padding_mask_"+str(idx)               #qc added previous key padding mask, qc remove
+                    output_prev_kv[pk] = list(incremental_state.values())[idx]["prev_key"]
+                    output_prev_kv[pv] = list(incremental_state.values())[idx]["prev_value"]
+                    # output_prev_kv[pk_pm] = list(incremental_state.values())[idx]["prev_key_padding_mask"] #qc added previous key padding mask #qc remove
+                    # if output_prev_kv[pk_pm] != None:
+                    #      output_prev_kv[pk_pm] = output_prev_kv[pk_pm].to(torch.uint8)
+                return output + (output_prev_kv, )
+
+        def cast_TransformerDecoderBase_2_QCTransformerDecoderBase(parent):
+            parent.__class__ = QCTransformerDecoderBase
+            return parent
+        
         for i, model in enumerate(self.models):
+            if self.has_incremental_states() and type(model.decoder) is TransformerDecoderBase:
+                model.decoder = cast_TransformerDecoderBase_2_QCTransformerDecoderBase(model.decoder)
+            
             if self.has_encoder():
                 encoder_out = encoder_outs[i]
+            if self.save_onnx:
+                self.decoder_export_onnx(model, step, tokens, encoder_out, incremental_states[i], self.decode_onnx_tag)
+                self.decode_onnx_tag +=1
+                if self.decode_onnx_tag >= 2 :
+                    self.save_onnx = False 
             # decode each model
             if self.has_incremental_states():
-                decoder_out = model.decoder.forward(
-                    tokens,
-                    encoder_out=encoder_out,
-                    incremental_state=incremental_states[i],
-                )
+                decoder_start_time = time.perf_counter()
+                if self.ort_engine:
+                    decoder_out = self.ORT_Inference_decoder(
+                        step,
+                        tokens,
+                        encoder_out=encoder_out,
+                        incremental_state=incremental_states[i])
+                    decoder_time = time.perf_counter() - decoder_start_time
+                    
+                    print(f"==ORT decoder time=={decoder_time*1000:.2f} ms with incremental")
+                else:
+                    if type(model.decoder) is TransformerDecoderBase:
+                        decoder_out = model.decoder.forward(
+                            tokens,
+                            encoder_out=encoder_out,
+                            incremental_state=incremental_states[i],
+                        )
+                    else: #torch decoder enters this loop always
+                        inputs = {}                   #qc comment for pt model we are preparing inc state here
+                        #qc shape fixing
+                        for idx in range(len(incremental_states[i])):
+                            pk = "prev_key_"+str(idx)
+                            pv = "prev_value_"+str(idx)
+                            pk_pm = 'prev_key_padding_mask_' + str(idx)   #qc added previous key padding mask #qc do not remove
+
+                            #inputs[pk_pm] = list(incremental_states[i].values())[idx]["prev_key_padding_mask"]    #qc added previous key padding mask, #qc remove
+
+
+                            #qc create prev key padding mask (uint8)
+
+                            if idx%2 == 1:
+                                inputs[pk_pm] = encoder_out["encoder_padding_mask"][0]
+
+                            else:
+                                tensor = torch.ones((1, qc_fixed_shape), dtype=torch.uint8)
+                                tensor[0, -(step[0,0]):] = 0
+                                inputs[pk_pm] = tensor
+                            '''
+                            inputs[pk_pm]
+                            if step is not 0, 
+                                odd index -> create 0 at last position 
+                                even index -> encoder padding mask
+                                
+                                e.g.
+                                tensor = torch.ones((1, qc_fixed_shape), dtype=torch.uint8) 
+                                tensor[0, -1] = 0                                             
+                                inputs[pk_pm] = tensor
+                                
+                                
+                            if step > 0:
+                                odd index -> create 0 from last till -(step + 1)
+                                even index -> encoder padding mask
+                                
+                                
+                            '''
+                            # qc create prev key padding mask
+
+                            inputs[pk] = list(incremental_states[i].values())[idx]["prev_key"]
+                            if inputs[pk].size(2) < qc_fixed_shape:  #qc shape fixing
+                                expanded_tensor_pk = torch.zeros(1,16,qc_fixed_shape,64)
+                                #expanded_tensor_pk[:, :, :inputs[pk].size(2), :] = inputs[pk]    #qc right padding
+                                expanded_tensor_pk[:, :, qc_fixed_shape-1:, :] = inputs[pk]       #qc left padding
+                                inputs[pk] = expanded_tensor_pk
+                                # tensor = torch.ones((1, qc_fixed_shape), dtype=torch.uint8)   #qc decoder self attention padding mask creation
+                                # tensor[0, -1] = 0                                             #qc remove, these 3 lines
+                                # inputs[pk_pm] = tensor
+
+                            if inputs[pk].size(2) == qc_fixed_shape + 1: #qc shape fixing
+                                #inputs[pk][:, :, step-1, :] = inputs[pk][:, :, qc_fixed_shape, :] #qc accuracy correction step -> step-1
+                                inputs[pk] = inputs[pk][:,:,1:,:]
+                                #inputs[pk] = inputs[pk][:, :, :qc_fixed_shape, :]
+                                #inputs[pk_pm][0,-(step+1)] = 0       #qc modify decoder self attention padding mask
+                                #inputs[pk_pm] = inputs[pk_pm][:,1:].type(torch.uint8)   #qc remove
+
+                            inputs[pv] = list(incremental_states[i].values())[idx]["prev_value"]
+                            if inputs[pv].size(2) < qc_fixed_shape:  #qc shape fixing
+                                expanded_tensor_pv = torch.zeros(1,16,qc_fixed_shape,64)
+                                #expanded_tensor_pv[:, :, :inputs[pv].size(2), :] = inputs[pv]  #qc right padding
+                                expanded_tensor_pv[:, :, qc_fixed_shape-1:, :] = inputs[pv]     #qc left padding
+                                inputs[pv] = expanded_tensor_pv
+
+                            if inputs[pv].size(2) == qc_fixed_shape + 1: #qc shape fixing
+                                #inputs[pv][:, :, step-1, :] = inputs[pv][:, :, qc_fixed_shape, :] #qc accuracy correction step -> step-1
+                                inputs[pv] = inputs[pv][:, :, 1:, :]
+                                #inputs[pv] = inputs[pv][:, :, :qc_fixed_shape, :]
+
+                        # inputs.update(encoder_out)
+                        inputs["encoder_out"] = encoder_out["encoder_out"]
+                        inputs["encoder_padding_mask"] = encoder_out["encoder_padding_mask"]
+                        decoder_out = (model.decoder.forward(
+                                                             tokens=tokens,
+                                                             inputs=inputs,
+                                                             step=step)) #qc step add
+
+                        # Pass to incremental_states[i]
+                        if len(list(incremental_states[i].keys())) == 0:
+                            prev_kv_state = QCTransformerDecoderBase.incremental_state_keys
+                        else:
+                            prev_kv_state = list(incremental_states[i].keys())
+                        
+                        incremental_states[i].clear()
+                        prev_kv = decoder_out[-1]
+                        for p in range(len(prev_kv_state)):
+                            incremental_states[i][prev_kv_state[p]] = {
+                                "prev_key": prev_kv["prev_key_"+str(p)],
+                                "prev_value": prev_kv["prev_value_"+str(p)]
+                                #"prev_key_padding_mask": prev_kv["prev_key_padding_mask_"+str(p)]  #qc added previous key padding mask, #qc remove OR create here for next pass
+                            }
+
+                    decoder_time = time.perf_counter() - decoder_start_time
+                    print(f"==torch decoder_time=={decoder_time*1000:.2f} ms with incremental")
+                    shapes=[]
+                    for id in range(6):
+                        shapes.append(list(incremental_states[i].values())[id]['prev_key'].shape)
+                    print(f"incremental_states dims={shapes[0]}")
             else:
                 if hasattr(model, "decoder"):
-                    decoder_out = model.decoder.forward(tokens, encoder_out=encoder_out)
+                    decoder_start_time = time.perf_counter()
+                    if self.ort_engine:
+                        decoder_out = self.ORT_Inference_decoder(
+                            step,
+                            tokens,
+                            encoder_out=encoder_out)
+                        decoder_time = time.perf_counter() - decoder_start_time
+                        print(f"==ORT decoder time=={decoder_time*1000:.2f} ms without incremental")
+                    else:
+                        decoder_out = model.decoder.forward(tokens, encoder_out=encoder_out)
+                        decoder_time = time.perf_counter() - decoder_start_time
+                        print(f"==torch decoder_time=={decoder_time*1000:.2f} ms without incremental")
                 else:
                     decoder_out = model.forward(tokens)
 
@@ -868,6 +1553,7 @@ class EnsembleModel(nn.Module):
         avg_probs = torch.logsumexp(torch.stack(log_probs, dim=0), dim=0) - math.log(
             self.models_size
         )
+
 
         if avg_attn is not None:
             avg_attn.div_(self.models_size)
